@@ -1,4 +1,5 @@
 import { migrate } from 'drizzle-orm/node-postgres/migrator';
+import { sql } from 'drizzle-orm';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import type { AppDb } from './index.js';
@@ -32,4 +33,18 @@ export async function runMigrations(db: AppDb): Promise<void> {
     );
   }
   await migrate(db, { migrationsFolder });
+
+  // Drizzle output is regenerated for clean installs, while this committed,
+  // idempotent migration safely upgrades databases that already ran an older
+  // generated 0000 migration. It creates app-owned state only.
+  const build2Candidates = [
+    resolve(here, '../../migrations/002_build2_workflow.sql'),
+    resolve(here, '../migrations/002_build2_workflow.sql'),
+  ];
+  const build2Path = build2Candidates.find((p) => fs.existsSync(p));
+  if (!build2Path) {
+    throw new Error(`Build 2 migration not found. Tried: ${build2Candidates.join(', ')}`);
+  }
+  const build2Sql = fs.readFileSync(build2Path, 'utf8');
+  await db.execute(sql.raw(build2Sql));
 }

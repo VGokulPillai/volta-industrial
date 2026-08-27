@@ -13,11 +13,13 @@
 import type { Application, Request, Response } from 'express';
 import type { AppDb } from '../db/index.js';
 import {
-  getEnrichedLineStatus,
-  getLinesSummary,
-  insertWorkOrder,
-  getRecentWorkOrders,
+  decideMaintenanceWorkflow,
+  getBuild2Lines,
+  getBuild2Summary,
+  getWorkflow,
+  proposeMaintenanceWorkflow,
 } from '../db/queries/maintenance.js';
+import { getCurrentUserEmail } from '../lib/user.js';
 
 export function registerOperationsRoutes(
   app: Application,
@@ -29,64 +31,79 @@ export function registerOperationsRoutes(
   app.get('/api/operations/lines', async (req: Request, res: Response) => {
     const status = req.query.status ? String(req.query.status) : undefined;
     const plantId = req.query.plant_id ? String(req.query.plant_id) : undefined;
-    const lines = await getEnrichedLineStatus(db, { status, plantId });
+    const lines = await getBuild2Lines(db, { status, plantId });
     res.json(lines);
   });
 
   // ── KPI summary ───────────────────────────────────────────────────────
   app.get('/api/operations/summary', async (_req: Request, res: Response) => {
-    const summary = await getLinesSummary(db);
+    const summary = await getBuild2Summary(db);
     res.json(summary);
   });
 
-  // ── Insert a new work order (manual row insertion from the UI) ────────
-  app.post('/api/operations/work-orders', async (req: Request, res: Response) => {
+  // ── Draft a proposal. This does not approve or execute anything. ──────
+  app.post('/api/operations/proposals', async (req: Request, res: Response) => {
     const {
       line_id,
-      action_type,
-      part_id,
+      proposed_action,
       drafted_work_order,
       memo,
-      predicted_downtime_cost_avoided_usd,
     } = req.body as {
       line_id: string;
-      action_type: 'pull_now' | 'run_to_shift_end' | 'expedite_parts_and_run';
-      part_id?: string | null;
+      proposed_action: 'pull_now' | 'run_to_shift_end' | 'expedite_parts_and_run';
       drafted_work_order: string;
-      memo?: string | null;
-      predicted_downtime_cost_avoided_usd?: number | null;
+      memo: string;
     };
 
-    if (!line_id || !action_type || !drafted_work_order) {
+    if (!line_id || !proposed_action || !drafted_work_order || !memo) {
       res.status(400).json({
-        error: 'line_id, action_type, and drafted_work_order are required.',
+        error: 'line_id, proposed_action, drafted_work_order, and memo are required.',
       });
       return;
     }
-
-    // Derive user email from the OBO context (Express request).
-    const userEmail =
-      (req as unknown as { userEmail?: string }).userEmail ??
-      (req.headers['x-forwarded-email'] as string | undefined) ??
-      'unknown';
-
-    const result = await insertWorkOrder(db, {
+    const result = await proposeMaintenanceWorkflow(db, {
       lineId: line_id,
-      actionType: action_type,
-      partId: part_id ?? null,
-      draftedWo: drafted_work_order,
-      memo: memo ?? null,
-      predictedDowntimeCostAvoidsUsd: predicted_downtime_cost_avoided_usd ?? null,
-      userEmail,
+      proposedAction: proposed_action,
+      draftedWorkOrder: drafted_work_order,
+      memo,
+      proposedBy: getCurrentUserEmail(req),
     });
-
-    res.status(201).json({ ok: true, action_id: result.actionId });
+    res.status(201).json({ ok: true, workflow_id: result.id });
   });
 
-  // ── Recent work orders ────────────────────────────────────────────────
-  app.get('/api/operations/work-orders', async (req: Request, res: Response) => {
-    const limit = req.query.limit ? Number(req.query.limit) : 20;
-    const orders = await getRecentWorkOrders(db, limit);
-    res.json(orders);
+  // ── Explicit human approve / reject / correct transaction ────────────
+  app.post('/api/operations/proposals/:id/decision', async (req, res) => {
+    const { decision, correction, corrected_action } = req.body as {
+      decision: 'approved' | 'rejected' | 'corrected';
+      correction?: string | null;
+      corrected_action?:
+        | 'pull_now'
+        | 'run_to_shift_end'
+        | 'expedite_parts_and_run'
+        | null;
+    };
+    if (!['approved', 'rejected', 'corrected'].includes(decision)) {
+      res.status(400).json({ error: 'decision must be approved, rejected, or corrected' });
+      return;
+    }
+    const committed = await decideMaintenanceWorkflow(db, {
+      workflowId: req.params.id,
+      decision,
+      approver: getCurrentUserEmail(req),
+      correction,
+      correctedAction: corrected_action,
+    });
+    // Closed-loop verification reads the committed row back before responding.
+    const nextRead = await getWorkflow(db, req.params.id);
+    res.json({ ok: true, committed, next_read: nextRead });
+  });
+
+  app.get('/api/operations/proposals/:id', async (req, res) => {
+    const workflow = await getWorkflow(db, req.params.id);
+    if (!workflow) {
+      res.status(404).json({ error: 'proposal not found' });
+      return;
+    }
+    res.json(workflow);
   });
 }

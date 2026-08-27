@@ -1,13 +1,12 @@
 command:
-  - streamlit
-  - run
-  - app.py
-  - --server.port
-  - "8000"
-  - --server.address
+  - uvicorn
+  - app:app
+  - --host
   - "0.0.0.0"
-  - --server.headless
-  - "true"
+  - --port
+  - "8000"
+  - --workers
+  - "2"
 env:
   - name: DATABRICKS_WAREHOUSE_ID
     value: "ced20c73f16a2915"

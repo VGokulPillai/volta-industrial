@@ -72,7 +72,6 @@ import * as mlflow from 'mlflow-tracing';
 
 import { createDb } from './db/index.js';
 import { runMigrations } from './db/migrate.js';
-import { syncFromDelta } from './db/sync.js';
 import { ensureMlflowExperiment } from './lib/mlflow.js';
 
 import { registerConfigRoutes } from './routes/config.js';
@@ -600,10 +599,8 @@ migrationsReady = (async () => {
   try {
     await runMigrations(db);
     console.log(`[boot +${ms()}] Migrations up to date`);
-    if (appConfig.data) {
-      await syncFromDelta(db, appConfig.data);
-      console.log(`[boot +${ms()}] Delta sync done`);
-    }
+    // Build 2 reads the existing Build 1 Lakebase tables directly. Do not copy,
+    // truncate or mutate app.line_status_synced / maintenance_notes here.
     migrationsDone = true;
   } catch (e) {
     // Real bug — the LLM customizing the template needs to act on this.

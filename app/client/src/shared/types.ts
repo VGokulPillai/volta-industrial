@@ -182,19 +182,29 @@ export type MaintenanceAction = 'pull_now' | 'run_to_shift_end' | 'expedite_part
 /** Enriched line row: line_status LEFT JOIN latest work_orders_app row. */
 export type PlantFloorLine = {
   lineId: string;
-  plantId: string;
+  plantId: string | null;
   lineName: string;
   plantName: string | null;
   region: string | null;
   failureRiskScore: number;
   downtimeExposureUsd: number;
   currentStatus: LineStatus;
-  /** From LEFT JOIN work_orders_app — null means no action taken yet. */
-  actionType: string | null;
-  actionStatus: string | null;
-  actionMemo: string | null;
-  actionId: string | null;
-  actionAt: string | null;
+  machineType: string | null;
+  criticality: string | null;
+  vibrationRms: number | null;
+  temperatureC: number | null;
+  partId: string | null;
+  partName: string | null;
+  partLocal: boolean | null;
+  partLeadTimeDays: number | null;
+  openWorkOrderId: string | null;
+  recommendation: MaintenanceAction | null;
+  flagged: boolean;
+  workflowId: string | null;
+  workflowStatus: 'proposed' | 'approved' | 'rejected' | 'corrected' | null;
+  proposedAction: MaintenanceAction | null;
+  approver: string | null;
+  committedAt: string | null;
 };
 
 export type PlantFloorSummary = {
@@ -203,17 +213,24 @@ export type PlantFloorSummary = {
   atRiskLines: number;
   totalDowntimeExposure: number;
   actionsTaken: number;
+  decisionsFlagged: number;
 };
 
-export type WorkOrderRow = {
+export type WorkflowDecision = {
   id: string;
   lineId: string;
-  actionType: string;
-  status: string;
-  memo: string | null;
-  draftedWo: string;
-  approvedBy: string | null;
+  recommendedAction: MaintenanceAction;
+  proposedAction: MaintenanceAction;
+  proposedBy: string;
+  memo: string;
+  draftedWorkOrder: string;
+  approvalStatus: 'proposed' | 'approved' | 'rejected' | 'corrected';
+  approver: string | null;
+  correction: string | null;
+  scoreSnapshot: unknown[];
   createdAt: string;
+  decidedAt: string | null;
+  committedAt: string | null;
 };
 
 export type ActivityEvent =

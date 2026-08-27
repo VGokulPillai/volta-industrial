@@ -52,12 +52,10 @@ import type { AppDb } from '../db/index.js';
 import { callMasEndpoint } from './tools/mas.js';
 import { callGenieSpace } from './tools/genie.js';
 import {
-  worstAtriskLine,
-  getAtriskLine,
-  getLineStatus,
-  getRecommendation,
-  searchParts,
-  recordMaintenanceAction,
+  getBuild1ActionRanking,
+  getBuild2Lines,
+  proposeMaintenanceWorkflow,
+  searchMaintenanceNotes,
 } from '../db/queries/maintenance.js';
 export type { ToolProgressEvent } from './tools/types.js';
 
@@ -148,7 +146,7 @@ function makeTools(ctx: AgentContext): Tool[] {
   const findAtriskLine = tool({
     name: 'find_atrisk_line',
     description:
-      'Read the worst at-risk production line from Lakebase: line_id, plant_id, line_name, failure_risk_score, downtime_exposure_usd, and the candidate part (part_local flag, part_id, lead_time_days). Read-only. Also return the line\'s current_status from app.line_status.',
+      'Read the ranked operational line state from existing Build 1 app.line_status_synced, enriched read-only with machine state, open work order, and part availability.',
     parameters: z.object({
       line_id: z
         .string()
@@ -159,33 +157,42 @@ function makeTools(ctx: AgentContext): Tool[] {
         .nullable()
         .describe('Plant id, e.g. PLANT-03. Null if line_id is also null.'),
     }),
-    execute: async ({ line_id }) =>
+    execute: async ({ line_id, plant_id }) =>
       mlflow.withSpan(
         async () => {
+          const lines = await getBuild2Lines(ctx.db, {
+            plantId: plant_id ?? undefined,
+          });
           const atrisk = line_id
-            ? (await getAtriskLine(ctx.db, line_id)) ??
-              (await worstAtriskLine(ctx.db))
-            : await worstAtriskLine(ctx.db);
+            ? lines.find((line) => line.lineId === line_id)
+            : lines.find((line) => line.currentStatus !== 'healthy');
           if (!atrisk) return { found: false as const };
-          const status = await getLineStatus(ctx.db, atrisk.lineId);
           return {
             found: true as const,
             line_id: atrisk.lineId,
             plant_id: atrisk.plantId,
             line_name: atrisk.lineName,
-            plant_name: status?.plantName ?? null,
+            plant_name: atrisk.plantName,
+            machine_type: atrisk.machineType,
+            criticality: atrisk.criticality,
             failure_risk_score: atrisk.failureRiskScore,
             downtime_exposure_usd: atrisk.downtimeExposureUsd,
-            current_status: status?.currentStatus ?? 'at_risk',
+            current_status: atrisk.currentStatus,
+            vibration_rms: atrisk.vibrationRms,
+            temperature_c: atrisk.temperatureC,
             part_local: atrisk.partLocal,
-            candidate_part_id: atrisk.candidatePartId,
+            candidate_part_id: atrisk.partId,
+            candidate_part_name: atrisk.partName,
             part_lead_time_days: atrisk.partLeadTimeDays,
+            open_work_order_id: atrisk.openWorkOrderId,
+            system_recommendation: atrisk.recommendation,
+            flagged_for_decision: atrisk.flagged,
           };
         },
         {
           name: 'find_atrisk_line',
           spanType: mlflow.SpanType.TOOL,
-          inputs: { line_id },
+          inputs: { line_id, plant_id },
         },
       ),
   });
@@ -201,32 +208,33 @@ function makeTools(ctx: AgentContext): Tool[] {
   const rankMaintenanceActions = tool({
     name: 'rank_maintenance_actions',
     description:
-      "Read the ML maintenance model's ranked actions for a line from Lakebase app.maintenance_recommendations: the recommended action, its predicted downtime cost avoided, and the full ranking of all three options (pull_now / run_to_shift_end / expedite_parts_and_run) with each option's downtime cost and net value. Read-only. Quote these in the draft; do the what-if arithmetically from the ranking.",
+      "Read Build 1 app.maintenance_actions and rank all three maintenance options by estimated net value. Use the score fields for grounded what-if comparisons.",
     parameters: z.object({
       line_id: z.string().describe('Line id, e.g. LINE-04.'),
     }),
     execute: async ({ line_id }) =>
       mlflow.withSpan(
         async () => {
-          const rec = await getRecommendation(ctx.db, line_id);
-          if (!rec) {
+          const ranking = await getBuild1ActionRanking(ctx.db, line_id);
+          if (!ranking.length) {
             return {
               scored: false as const,
-              note: 'No maintenance recommendation yet — build + score the maintenance_recommender model (Build 2 ML step) or the Gold heuristic table, then reset the demo.',
+              note: 'No Build 1 maintenance_actions scores exist for this line.',
             };
           }
           return {
             scored: true as const,
-            line_id: rec.lineId,
-            recommended_action: rec.recommendedAction,
-            predicted_downtime_cost_usd: rec.predictedDowntimeCostUsd,
-            action_ranking: rec.actionRanking.map((o) => ({
+            line_id,
+            recommended_action: ranking[0].action,
+            action_ranking: ranking.map((o) => ({
               action: o.action,
               predicted_downtime_cost_avoided_usd:
-                o.predictedDowntimeCostAvoidsUsd ?? null,
-              estimated_net_value_usd: o.estimatedNetValueUsd ?? null,
-              part_id: o.partId ?? null,
-              estimated_lead_time_days: o.estimatedLeadTimeDays ?? null,
+                o.expectedDowntimeAvoidedHours == null
+                  ? null
+                  : o.expectedDowntimeAvoidedHours * 22000,
+              estimated_net_value_usd: o.estimatedNetValueUsd,
+              action_cost_usd: o.actionCostUsd,
+              expected_downtime_avoided_hours: o.expectedDowntimeAvoidedHours,
             })),
           };
         },
@@ -241,37 +249,35 @@ function makeTools(ctx: AgentContext): Tool[] {
   // ── search_parts — TRAINEE BUILDS (Build 2c · Search). STUB. ──────────────
   // TODO — BUILD 2c (trainee): implement this. Search app.parts (Lakebase Search)
   // for parts matching the query (description field). Return top 5–10 matches.
-  const searchParts = tool({
-    name: 'search_parts',
+  const searchNotes = tool({
+    name: 'search_maintenance_notes',
     description:
-      'Search the parts catalog via Lakebase Search over part names + descriptions. Returns top matches with part_id, part_name, part_category, part_local, lead_time_days. Use when exploring alternatives or verifying part availability.',
+      'Search the existing Build 1 app.maintenance_notes Lakebase Search index. Read-only and governed; no separate vector store. Use it to explain symptoms, prior technician observations, and what-if assumptions.',
     parameters: z.object({
       query: z
         .string()
-        .describe('Free-text search query, e.g. "bearing seal 40mm" or "hydraulic pump".'),
+        .describe('Natural-language maintenance evidence query.'),
+      line_id: z
+        .string()
+        .nullable()
+        .describe('Optional line id used to constrain search; null searches all notes.'),
     }),
-    execute: async ({ query }) =>
+    execute: async ({ query, line_id }) =>
       mlflow.withSpan(
         async () => {
-          const candidates = await searchParts(ctx.db, query);
-          if (candidates.length === 0) {
+          const notes = await searchMaintenanceNotes(ctx.db, query, line_id);
+          if (notes.length === 0) {
             return { matches_found: false as const, note: 'No matching parts found.' };
           }
           return {
             matches_found: true as const,
-            candidates: candidates.map((c) => ({
-              part_id: c.partId,
-              part_name: c.partName,
-              part_category: c.partCategory,
-              part_local: c.partLocal,
-              lead_time_days: c.leadTimeDays,
-            })),
+            notes,
           };
         },
         {
-          name: 'search_parts',
+          name: 'search_maintenance_notes',
           spanType: mlflow.SpanType.TOOL,
-          inputs: { query },
+          inputs: { query, line_id },
         },
       ),
   });
@@ -285,19 +291,15 @@ function makeTools(ctx: AgentContext): Tool[] {
   // (line_id, action_type, part_id?) + the drafted WO text — NEVER a list of ids.
   // Wrap the write in db.transaction(...). On commit the caller emits dataMutated
   // so the Plant Floor page cascades. See APP_WORKSHOP.md → "Layer 3 — Act".
-  const executeMaintenanceAction = tool({
-    name: 'execute_maintenance_action',
+  const proposeMaintenanceAction = tool({
+    name: 'propose_maintenance_action',
     description:
-      'WRITE (requires prior user approval): record the approved maintenance action to Lakebase app.work_orders_app — action_type, line_id, part_id, the drafted work order, predicted downtime cost avoided — append an audit entry, and set status to approved. Inputs are a FILTER + the drafted WO text, never a list of ids. Use ONLY after the user says yes.',
+      'Create a PROPOSED maintenance workflow with an auto-drafted memo and work order. This never approves or executes the proposal. A human must explicitly approve, reject, or correct it through the Operations decision controls.',
     parameters: z.object({
       line_id: z.string().describe('Production line id, e.g. LINE-04.'),
       action_type: z
         .enum(['pull_now', 'run_to_shift_end', 'expedite_parts_and_run'])
         .describe('The approved maintenance action.'),
-      part_id: z
-        .string()
-        .nullable()
-        .describe('Part id if the action involves expediting parts, else null.'),
       drafted_work_order: z
         .string()
         .describe('The full drafted work order text (the maintenance ticket).'),
@@ -305,49 +307,50 @@ function makeTools(ctx: AgentContext): Tool[] {
         .string()
         .nullable()
         .describe('A brief executive summary / analysis memo (2–4 sentences) summarizing the investigation findings, risk assessment, and rationale for the recommended action. This is auto-generated as the output of the analysis — it is stored with the work order for later review.'),
-      predicted_downtime_cost_avoided_usd: z
-        .number()
-        .nullable()
-        .describe('Predicted $ of downtime cost avoided by this action.'),
     }),
     execute: async ({
       line_id,
       action_type,
-      part_id,
       drafted_work_order,
       memo,
-      predicted_downtime_cost_avoided_usd,
     }) =>
       mlflow.withSpan(
         async () => {
-          const { actionId } = await recordMaintenanceAction(ctx.db, {
+          if (!memo) throw new Error('A proposal requires an auto-drafted memo');
+          const proposal = await proposeMaintenanceWorkflow(ctx.db, {
             lineId: line_id,
-            actionType: action_type,
-            partId: part_id,
-            draftedWo: drafted_work_order,
+            proposedAction: action_type,
+            draftedWorkOrder: drafted_work_order,
             memo: memo,
-            predictedDowntimeCostAvoidsUsd: predicted_downtime_cost_avoided_usd,
-            userEmail: ctx.userEmail,
+            proposedBy: ctx.userEmail,
           });
           return {
-            recorded: true as const,
-            action_id: actionId,
+            proposed: true as const,
+            workflow_id: proposal.id,
             line_id,
-            action_type,
-            predicted_downtime_cost_avoided_usd,
+            proposed_action: action_type,
+            approval_status: 'proposed',
+            created_at: proposal.created_at,
+            next_step:
+              'A human must explicitly approve, reject, or correct this proposal in Operations.',
           };
         },
         {
-          name: 'execute_maintenance_action',
+          name: 'propose_maintenance_action',
           spanType: mlflow.SpanType.TOOL,
-          inputs: { line_id, action_type, part_id },
+          inputs: { line_id, action_type },
         },
       ),
   });
 
   // Config-driven data-backend tool registration. Register ONLY when a backend
   // is configured (otherwise the tool would 404 confusingly).
-  const tools: Tool[] = [findAtriskLine, rankMaintenanceActions, searchParts, executeMaintenanceAction];
+  const tools: Tool[] = [
+    findAtriskLine,
+    rankMaintenanceActions,
+    searchNotes,
+    proposeMaintenanceAction,
+  ];
   if (ctx.masEndpointName) {
     tools.push(askData);
   } else if (ctx.genieSpaceId) {
@@ -568,26 +571,19 @@ find_atrisk_line(line_id?, plant_id?) — read the worst at-risk production line
   downtime_exposure_usd, and the candidate part (part_local flag, part_id,
   lead_time_days). If both null, returns the worst at-risk line.
 
-rank_maintenance_actions(line_id) — THE ML RANKING TOOL. Read app.maintenance_recommendations
-  for the line and return the model's recommended_action, predicted_downtime_cost_usd,
-  and the full action_ranking (all three options: pull_now / run_to_shift_end /
-  expedite_parts_and_run). Quote all three in the draft; the agent picks which to
-  recommend.
+rank_maintenance_actions(line_id) — read the existing Build 1
+  app.maintenance_actions scores and compare all three options. Quote the
+  estimated net value, action cost and downtime avoided for every option.
 
-search_parts(query) — search the parts catalog via Lakebase Search over names +
-  descriptions. Returns top matches with part_id, part_name, part_category,
-  part_local, lead_time_days. Use when exploring parts or verifying availability.
+search_maintenance_notes(query, line_id?) — search the existing Build 1
+  app.maintenance_notes Lakebase Search index. Use these technician notes to
+  explain why a line is at risk and to ground what-if analysis. Do not invent
+  notes and do not use or request a separate vector store.
 
-execute_maintenance_action(line_id, action_type, part_id?, drafted_work_order,
-  memo?, predicted_downtime_cost_avoided_usd?) — THE WRITE TOOL, APPROVAL-GATED.
-  Record the approved action to app.work_orders_app: action_type, line_id,
-  part_id, drafted_wo, memo (analysis summary), predicted_downtime_cost_avoided_usd,
-  status='approved', approved_by from userEmail, plus an audit entry.
-  The `memo` field is an auto-drafted executive summary of your analysis —
-  a 2–4 sentence note capturing the investigation findings, risk assessment,
-  and rationale. ALWAYS generate a memo. Inputs are a FILTER + drafted
-  text, never a list of ids. **This is how you execute phase 3.** Do NOT call
-  until the user has explicitly approved.
+propose_maintenance_action(line_id, action_type, drafted_work_order, memo) —
+  create a PROPOSAL only. Auto-draft both the executive memo and work order.
+  The returned workflow_id remains approval_status='proposed'. This tool cannot
+  approve, reject, correct, or execute a decision.
 
 THERE ARE NO OTHER TOOLS. There is no manual_override, no single-part search,
 no "add notes". Everything you can do is in the tools above.
@@ -634,9 +630,8 @@ which happens on moderate-risk lines. For a high-risk line whose part is non-loc
 the part_local flag decides which options are even viable. Never present the three as
 equal choices; let the ranking + part locality drive the recommendation.
 
-Phase 1 and 2 are "prepare + show the user what will happen". Phase 3
-is the write tool. NEVER run phase 3 (execute_maintenance_action) until the
-user has explicitly approved.
+Phase 1 and 2 prepare a governed proposal. Phase 3 is an explicit human
+transaction in the Operations UI; you cannot silently complete it.
 
 --- Phase 1 · Discover (read-only) ---
 
@@ -646,14 +641,16 @@ user has explicitly approved.
      and plant_id from the answer. If ask_data cannot produce a clear line,
      ask the user once — do not guess.
 
-  2. Call find_atrisk_line(line_id, plant_id). Output: line_name,
+  2. Call find_atrisk_line(line_id, plant_id). This reads Build 1
+     app.line_status_synced and related operational tables. Output: line_name,
      failure_risk_score, downtime_exposure_usd, part_local, candidate_part_id,
      part_lead_time_days, current_status. Remember these — you quote them in
      Phase 2.
 
-  3. Call rank_maintenance_actions(line_id). Output: recommended_action,
-     predicted_downtime_cost_usd, action_ranking (all three options with
-     predicted downtime costs + net $). Remember the full ranking — you
+  3. Call search_maintenance_notes with a focused symptoms query, then call
+     rank_maintenance_actions(line_id). Output: recommended_action and
+     action_ranking (all three options with action cost, downtime avoided and
+     net $). Remember the full ranking — you
      quote ALL THREE options in Phase 2 because the story beat is "here's
      what the model ranked".
 
@@ -668,47 +665,28 @@ user has explicitly approved.
        - Action: detailed work order steps for the recommended action.
        - Impact: predicted downtime cost avoided + schedule impact.
 
-  5. Reply to the user with:
+  5. Call propose_maintenance_action exactly once with the complete memo and
+     work order. Then reply to the user with:
        - A bold headline: "LINE-{id} (PLANT-{pid}) is trending toward failure.
          Risk score {X}%. Recommended action: {action}. Downtime exposure: $\{Y\}."
        - The drafted work order in a fenced markdown block.
        - The full ranked options as a markdown table:
          | Action | Predicted Cost Avoided | Est. Net Value |
          showing pull_now / run_to_shift_end / expedite_parts_and_run.
-       - A single-sentence CTA:
-           "Reply **pull the line** to approve the recommended action —
-            or ask me to reconsider."
+       - The workflow_id and a single-sentence CTA:
+           "Review this proposal in Operations, then explicitly Approve,
+            Reject, or Correct it."
 
      STOP HERE. Do not proceed until the user's next message.
 
---- Phase 3 · Execute the action (on approval) ---
+--- Phase 3 · Human decision ---
 
-  Triggered only when the user's NEXT message is an approval (any form:
-  "pull", "go", "ok", "approved", "ship it", "do it", "yes", "proceed",
-  "looks good", "execute"). Anything that looks like a revision
-  ("make it safer", "add more detail", "how long will it take") means →
-  revise ONLY the affected section of the work order and go back to phase 2
-  step 5 (STOP for confirmation again). Do NOT re-rank options on revision.
-
-  On approval:
-
-    A. Call execute_maintenance_action exactly ONCE with:
-         line_id: the line id from phase 1 step 1
-         action_type: the recommended_action from rank_maintenance_actions
-         part_id: the candidate_part_id (or null if action doesn't need parts)
-         drafted_work_order: the full work order text from phase 2 step 4
-         memo: a 2–4 sentence executive summary of YOUR analysis —
-           what you found (investigation), what the risk is (risk score,
-           downtime exposure), and why this action was chosen (ML ranking,
-           part locality). This memo is stored with the work order and
-           serves as the auto-drafted analysis note. ALWAYS include it.
-         predicted_downtime_cost_avoided_usd: from rank_maintenance_actions
-
-    B. Final summary — see "SUMMARY FORMAT" below. Use counts + values
-       returned by the tool, not your own memory.
-
-If execute_maintenance_action errors, surface the error plainly. Never
-pretend a tool ran.
+  Approval, rejection and correction happen only through the Operations
+  proposal controls. If the user types approval in chat, explain that the
+  explicit UI control is required and link them to Operations. The server locks
+  the proposal, verifies it is still proposed, stamps approver + decision and
+  committed timestamps, commits once, and performs a closed-loop read. Never
+  claim that a decision committed unless a tool or API response proves it.
 
 ════════════════════════════════════════════════════════════
 WORK ORDER CRAFT

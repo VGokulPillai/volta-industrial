@@ -200,6 +200,98 @@ export const parts = appSchema.table(
   ],
 );
 
+// Build 2 application-owned workflow state. Build 1 operational/synced tables
+// remain read-only; every score, proposal and human decision is recorded here.
+export const maintenanceWorkflows = appSchema.table(
+  'maintenance_workflows',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    lineId: text('line_id').notNull(),
+    trigger: text('trigger', { enum: ['system', 'assistant', 'operator'] })
+      .notNull()
+      .default('system'),
+    scoreSnapshot: jsonb('score_snapshot')
+      .$type<MaintenanceActionOption[]>()
+      .notNull()
+      .default([]),
+    recommendedAction: text('recommended_action', {
+      enum: ['pull_now', 'run_to_shift_end', 'expedite_parts_and_run'],
+    }).notNull(),
+    proposedAction: text('proposed_action', {
+      enum: ['pull_now', 'run_to_shift_end', 'expedite_parts_and_run'],
+    }).notNull(),
+    proposedBy: text('proposed_by').notNull(),
+    memo: text('memo').notNull(),
+    draftedWorkOrder: text('drafted_work_order').notNull(),
+    approvalStatus: text('approval_status', {
+      enum: ['proposed', 'approved', 'rejected', 'corrected'],
+    })
+      .notNull()
+      .default('proposed'),
+    approver: text('approver'),
+    correction: text('correction'),
+    createdAt: timestamp('created_at', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    decidedAt: timestamp('decided_at', { withTimezone: true }),
+    committedAt: timestamp('committed_at', { withTimezone: true }),
+  },
+  (t) => [
+    index('maintenance_workflows_line_idx').on(t.lineId, t.createdAt),
+    index('maintenance_workflows_status_idx').on(t.approvalStatus),
+  ],
+);
+
+export const systemDecisionScores = appSchema.table(
+  'system_decision_scores',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    lineId: text('line_id').notNull(),
+    trigger: text('trigger').notNull().default('line_status_read'),
+    rankedActions: jsonb('ranked_actions')
+      .$type<MaintenanceActionOption[]>()
+      .notNull()
+      .default([]),
+    recommendedAction: text('recommended_action', {
+      enum: ['pull_now', 'run_to_shift_end', 'expedite_parts_and_run'],
+    }).notNull(),
+    flagged: boolean('flagged').notNull().default(false),
+    scoredAt: timestamp('scored_at', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('system_decision_scores_line_trigger_uq').on(t.lineId, t.trigger),
+    index('system_decision_scores_flagged_idx').on(t.flagged, t.scoredAt),
+  ],
+);
+
+// Minimal, non-secret metadata for auditability and product analytics.
+export const assistantInteractions = appSchema.table(
+  'assistant_interactions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    conversationId: uuid('conversation_id').references(() => conversations.id, {
+      onDelete: 'set null',
+    }),
+    userEmail: text('user_email').notNull(),
+    intent: text('intent').notNull(),
+    toolsUsed: jsonb('tools_used').$type<string[]>().notNull().default([]),
+    traceId: text('trace_id'),
+    outcome: text('outcome', {
+      enum: ['completed', 'failed', 'canceled'],
+    }).notNull(),
+    latencyMs: integer('latency_ms').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => [
+    index('assistant_interactions_conversation_idx').on(t.conversationId),
+    index('assistant_interactions_user_idx').on(t.userEmail, t.createdAt),
+  ],
+);
+
 // Application-owned table: maintenance work orders drafted and approved by the agent.
 export const workOrdersApp = appSchema.table(
   'work_orders_app',

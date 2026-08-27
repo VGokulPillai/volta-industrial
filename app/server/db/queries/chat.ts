@@ -2,10 +2,34 @@ import { and, asc, desc, eq, sql } from 'drizzle-orm';
 import type { AppDb } from '../index.js';
 import {
   conversations,
+  assistantInteractions,
   feedback,
   messages,
   type ThinkingEntry,
 } from '../schema.js';
+
+export async function recordAssistantInteraction(
+  db: AppDb,
+  args: {
+    conversationId?: string | null;
+    userEmail: string;
+    intent: string;
+    toolsUsed: string[];
+    traceId?: string | null;
+    outcome: 'completed' | 'failed' | 'canceled';
+    latencyMs: number;
+  },
+) {
+  await db.insert(assistantInteractions).values({
+    conversationId: args.conversationId ?? null,
+    userEmail: args.userEmail,
+    intent: args.intent.slice(0, 200),
+    toolsUsed: args.toolsUsed,
+    traceId: args.traceId ?? null,
+    outcome: args.outcome,
+    latencyMs: args.latencyMs,
+  });
+}
 
 export async function listConversations(db: AppDb, userEmail: string) {
   return db

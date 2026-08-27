@@ -2,6 +2,7 @@ import type { Request, Response } from 'express';
 import type { AppDb } from '../db/index.js';
 import {
   appendMessage,
+  recordAssistantInteraction,
   renameConversationIfDefault,
 } from '../db/queries/index.js';
 import { getCurrentUserEmail } from '../lib/user.js';
@@ -41,6 +42,7 @@ export async function handleChatStream(args: {
   config: ChatConfig;
 }): Promise<void> {
   const { req, res, db, config } = args;
+  const turnStartedAt = Date.now();
 
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -310,6 +312,25 @@ export async function handleChatStream(args: {
         `Reply wasn't saved (${cause?.code ?? 'db error'}). It's visible now but won't survive reload.`,
       );
     }
+  }
+
+  // Persist only operational metadata: no prompt/response bodies or credentials.
+  try {
+    await recordAssistantInteraction(db, {
+      conversationId,
+      userEmail,
+      intent: lastClean.content,
+      toolsUsed: thinking
+        .filter((entry) => entry.kind === 'tool_call')
+        .map((entry) => (entry.kind === 'tool_call' ? entry.name : '')),
+      traceId,
+      outcome: canceled ? 'canceled' : errorText ? 'failed' : 'completed',
+      latencyMs: Date.now() - turnStartedAt,
+    });
+  } catch (e) {
+    console.error('[db] persist assistant interaction metadata failed', {
+      message: (e as Error).message,
+    });
   }
 
   // Skip the [DONE] write if the client already disconnected (refresh /

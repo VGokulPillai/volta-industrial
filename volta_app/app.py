@@ -1,71 +1,94 @@
-"""
-Volta Plant Floor — Predictive Maintenance (Databricks App, Streamlit).
+"""FastAPI backend for the Volta Plant Floor React application."""
 
-Reads the live gold tables from the SQL warehouse and answers analytical "why"
-questions via the Volta Genie space. Auth is the app's service principal
-(Config() auto-detects DATABRICKS_CLIENT_ID/SECRET injected by Databricks Apps).
-"""
+from __future__ import annotations
+
 import json
+import math
 import os
 import time
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any
 
-import pandas as pd
-import streamlit as st
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.sql import StatementState
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
+
 
 CATALOG = os.getenv("VOLTA_CATALOG", "serverless_stable_wx20co_catalog")
 SCHEMA = os.getenv("VOLTA_SCHEMA", "dev_gokul_pillai_volta_industrial")
 WAREHOUSE_ID = os.getenv("DATABRICKS_WAREHOUSE_ID", "")
 GENIE_SPACE_ID = os.getenv("GENIE_SPACE_ID", "")
 FQ = f"{CATALOG}.{SCHEMA}"
+FRONTEND_DIST = Path(__file__).parent / "frontend" / "dist"
 
-st.set_page_config(page_title="Volta Plant Floor", page_icon="⚙️", layout="wide")
+app = FastAPI(
+    title="Volta Plant Floor API",
+    version="2.0.0",
+    description="Predictive maintenance operations powered by Databricks.",
+)
 
 
-@st.cache_resource
-def get_client() -> WorkspaceClient:
+class GenieRequest(BaseModel):
+    question: str = Field(min_length=2, max_length=1_000)
+
+
+def workspace_client() -> WorkspaceClient:
+    """Use Databricks App service-principal credentials injected at runtime."""
     return WorkspaceClient()
 
 
-def run_sql(query: str) -> pd.DataFrame:
-    w = get_client()
-    resp = w.statement_execution.execute_statement(
-        statement=query, warehouse_id=WAREHOUSE_ID,
-        catalog=CATALOG, schema=SCHEMA, wait_timeout="30s",
+def json_value(value: Any) -> Any:
+    """Normalize SDK/SQL values into strict JSON values."""
+    if value is None:
+        return None
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, (int, float)):
+        return value if not isinstance(value, float) or math.isfinite(value) else None
+    if isinstance(value, (dict, list, bool)):
+        return value
+    return str(value)
+
+
+def execute_sql(statement: str) -> list[dict[str, Any]]:
+    if not WAREHOUSE_ID:
+        raise RuntimeError("DATABRICKS_WAREHOUSE_ID is not configured")
+
+    client = workspace_client()
+    response = client.statement_execution.execute_statement(
+        statement=statement,
+        warehouse_id=WAREHOUSE_ID,
+        catalog=CATALOG,
+        schema=SCHEMA,
+        wait_timeout="30s",
     )
-    sid = resp.statement_id
-    state = resp.status.state
+    statement_id = response.statement_id
+    state = response.status.state
     while state in (StatementState.PENDING, StatementState.RUNNING):
-        time.sleep(1)
-        resp = w.statement_execution.get_statement(sid)
-        state = resp.status.state
+        time.sleep(0.75)
+        response = client.statement_execution.get_statement(statement_id)
+        state = response.status.state
+
     if state != StatementState.SUCCEEDED:
-        msg = resp.status.error.message if resp.status and resp.status.error else "unknown error"
-        raise RuntimeError(f"SQL failed: {msg}")
-    cols = [c.name for c in resp.manifest.schema.columns]
-    data = resp.result.data_array if resp.result and resp.result.data_array else []
-    return pd.DataFrame(data, columns=cols)
+        error = response.status.error if response.status else None
+        raise RuntimeError(getattr(error, "message", None) or "SQL statement failed")
+
+    columns = [column.name for column in response.manifest.schema.columns]
+    rows = response.result.data_array if response.result and response.result.data_array else []
+    return [
+        {column: json_value(value) for column, value in zip(columns, row)}
+        for row in rows
+    ]
 
 
-@st.cache_data(ttl=120)
-def load(query: str) -> pd.DataFrame:
-    return run_sql(query)
-
-
-def num(series):
-    return pd.to_numeric(series, errors="coerce")
-
-
-# ── Header ────────────────────────────────────────────────────────────────────
-st.title("⚙️ Volta Plant Floor — Predictive Maintenance")
-st.caption(
-    "One connected experience: Lakebase operational state · gold analytics · Genie "
-    "investigation · governed AI. Preventing unplanned downtime across 8 plants."
-)
-
-try:
-    fleet = load(f"""
+def fleet_query() -> list[dict[str, Any]]:
+    return execute_sql(
+        f"""
         SELECT plant_id, plant_name, line_id, line_name, machine_type,
                CAST(failure_risk_score AS DOUBLE) AS failure_risk_score,
                CAST(downtime_exposure_usd AS DOUBLE) AS downtime_exposure_usd,
@@ -73,153 +96,147 @@ try:
                risk_band, current_status,
                CAST(open_wo_count AS INT) AS open_wo_count,
                has_open_corrective, part_local,
-               CAST(plant_lat AS DOUBLE) AS lat, CAST(plant_lng AS DOUBLE) AS lon
+               CAST(plant_lat AS DOUBLE) AS lat,
+               CAST(plant_lng AS DOUBLE) AS lon
         FROM {FQ}.gold_line_status
-    """)
-except Exception as e:
-    st.error(
-        "Couldn't read the gold tables. The app's service principal likely needs "
-        f"SELECT on `{FQ}` and CAN USE on the SQL warehouse.\n\nDetails: {e}"
-    )
-    st.stop()
-
-fleet["failure_risk_score"] = num(fleet["failure_risk_score"])
-fleet["downtime_exposure_usd"] = num(fleet["downtime_exposure_usd"])
-fleet["utilization_pct"] = num(fleet["utilization_pct"])
-
-at_risk = fleet[fleet["risk_band"].isin(["critical", "elevated", "watch"])]
-critical = fleet[fleet["risk_band"] == "critical"]
-
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Lines monitored", f"{len(fleet):,}")
-c2.metric("At-risk lines", f"{len(at_risk):,}")
-c3.metric("Critical lines", f"{len(critical):,}")
-c4.metric("Downtime exposure", f"${fleet['downtime_exposure_usd'].sum()/1e6:,.1f}M")
-
-tab_floor, tab_hero, tab_genie = st.tabs(
-    ["🏭 Plant Floor", "🎯 LINE-04 (Hero)", "💬 Ask Genie"]
-)
-
-# ── Plant Floor ───────────────────────────────────────────────────────────────
-with tab_floor:
-    left, right = st.columns([3, 2])
-    with left:
-        st.subheader("At-risk lines — ranked by downtime exposure")
-        show = at_risk.sort_values("downtime_exposure_usd", ascending=False)[
-            ["line_id", "plant_name", "machine_type", "risk_band",
-             "failure_risk_score", "downtime_exposure_usd", "open_wo_count", "part_local"]
-        ].head(50)
-        st.dataframe(
-            show, use_container_width=True, hide_index=True,
-            column_config={
-                "failure_risk_score": st.column_config.ProgressColumn(
-                    "risk", min_value=0.0, max_value=1.0, format="%.2f"),
-                "downtime_exposure_usd": st.column_config.NumberColumn(
-                    "exposure", format="$%.0f"),
-            },
-        )
-    with right:
-        st.subheader("Exposure by plant")
-        by_plant = (
-            at_risk.groupby("plant_name")["downtime_exposure_usd"].sum().sort_values(ascending=False)
-        )
-        st.bar_chart(by_plant)
-        st.subheader("Fleet map (at-risk)")
-        geo = at_risk.dropna(subset=["lat", "lon"])[["lat", "lon"]]
-        if not geo.empty:
-            st.map(geo, size=20)
-
-    st.subheader("Risk vs utilization (the red cluster)")
-    st.scatter_chart(
-        fleet.dropna(subset=["utilization_pct", "failure_risk_score"]),
-        x="utilization_pct", y="failure_risk_score", color="risk_band",
+        ORDER BY downtime_exposure_usd DESC
+        """
     )
 
-# ── Hero: LINE-04 ─────────────────────────────────────────────────────────────
-with tab_hero:
-    st.subheader("LINE-04 @ PLANT-03 — the spotlight")
-    hero = fleet[fleet["line_id"] == "LINE-0004"]
-    if hero.empty:
-        st.warning("LINE-0004 not found in gold_line_status.")
-    else:
-        h = hero.iloc[0]
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Failure risk", f"{h['failure_risk_score']:.2f}")
-        m2.metric("Risk band", str(h["risk_band"]))
-        m3.metric("Open work orders", int(h["open_wo_count"]))
-        m4.metric("Part stocked locally", "No" if str(h["part_local"]).lower() in ("false", "0") else "Yes")
 
+@app.get("/api/health", operation_id="getHealth")
+async def health() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "framework": "FastAPI + React",
+        "catalog": CATALOG,
+        "schema": SCHEMA,
+        "warehouseConfigured": bool(WAREHOUSE_ID),
+        "genieConfigured": bool(GENIE_SPACE_ID),
+    }
+
+
+@app.get("/api/fleet", operation_id="listFleet")
+async def list_fleet() -> list[dict[str, Any]]:
+    try:
+        return await run_in_threadpool(fleet_query)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/summary", operation_id="getFleetSummary")
+async def get_summary() -> dict[str, Any]:
+    try:
+        rows = await run_in_threadpool(fleet_query)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    def number(row: dict[str, Any], key: str) -> float:
         try:
-            rec = load(f"""
-                SELECT recommended_action,
-                       CAST(predicted_net_value_usd AS DOUBLE) AS predicted_net_value_usd,
-                       action_ranking
-                FROM {FQ}.gold_maintenance_recommendations
-                WHERE line_id = 'LINE-0004'
-            """)
-            if not rec.empty:
-                r = rec.iloc[0]
-                st.success(
-                    f"**Recommended action: `{r['recommended_action']}`** "
-                    f"(net value ≈ ${float(r['predicted_net_value_usd']):,.0f})"
-                )
-                try:
-                    options = json.loads(r["action_ranking"])
-                    opt_df = pd.DataFrame(options)
-                    st.markdown("**All candidate actions (ranked by net value):**")
-                    st.dataframe(opt_df, use_container_width=True, hide_index=True)
-                except Exception:
-                    st.code(r["action_ranking"])
-        except Exception as e:
-            st.info(f"Recommendation unavailable: {e}")
+            return float(row.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0.0
 
-        st.markdown(
-            "> Telemetry is trending to failure **and** the replacement part isn't "
-            "stocked locally — so an unplanned stop (downtime + expedite premium) "
-            "costs more than pulling the line now. That's why **pull_now** wins."
+    return {
+        "totalLines": len(rows),
+        "atRiskLines": sum(
+            row.get("risk_band") in {"critical", "elevated", "watch"} for row in rows
+        ),
+        "criticalLines": sum(row.get("risk_band") == "critical" for row in rows),
+        "downtimeExposureUsd": sum(number(row, "downtime_exposure_usd") for row in rows),
+        "openWorkOrders": sum(int(number(row, "open_wo_count")) for row in rows),
+    }
+
+
+@app.get("/api/recommendations/{line_id}", operation_id="getRecommendation")
+async def get_recommendation(line_id: str) -> dict[str, Any]:
+    safe_line_id = line_id.replace("'", "''")
+    try:
+        rows = await run_in_threadpool(
+            execute_sql,
+            f"""
+            SELECT line_id, recommended_action,
+                   CAST(predicted_net_value_usd AS DOUBLE) AS predicted_net_value_usd,
+                   action_ranking
+            FROM {FQ}.gold_maintenance_recommendations
+            WHERE line_id = '{safe_line_id}'
+            LIMIT 1
+            """,
         )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-# ── Genie ─────────────────────────────────────────────────────────────────────
-with tab_genie:
-    st.subheader("Ask the data — Genie (natural language)")
-    st.caption(f"Space: {GENIE_SPACE_ID or '(not configured)'}")
-    examples = [
-        "Which plant has the highest total downtime exposure?",
-        "How many lines are in the critical risk band?",
-        "What is the failure risk score for LINE-0004?",
-    ]
-    q = st.text_input("Your question", value=examples[0])
-    cols = st.columns(len(examples))
-    for i, ex in enumerate(examples):
-        if cols[i].button(ex, key=f"ex{i}"):
-            q = ex
-    if st.button("Ask Genie", type="primary") and q and GENIE_SPACE_ID:
-        with st.spinner("Genie is thinking…"):
-            try:
-                w = get_client()
-                msg = w.genie.start_conversation_and_wait(GENIE_SPACE_ID, q)
-                answered = False
-                for att in (msg.attachments or []):
-                    if getattr(att, "text", None) and att.text.content:
-                        st.markdown(att.text.content)
-                        answered = True
-                    if getattr(att, "query", None):
-                        qy = att.query
-                        if getattr(qy, "description", None):
-                            st.markdown(qy.description)
-                        try:
-                            res = w.genie.get_message_query_result(
-                                GENIE_SPACE_ID, msg.conversation_id, msg.id)
-                            sd = res.statement_response
-                            if sd and sd.result and sd.result.data_array:
-                                cols_ = [c.name for c in sd.manifest.schema.columns]
-                                st.dataframe(pd.DataFrame(sd.result.data_array, columns=cols_),
-                                             use_container_width=True, hide_index=True)
-                                answered = True
-                        except Exception:
-                            if getattr(qy, "query", None):
-                                st.code(qy.query, language="sql")
-                if not answered and getattr(msg, "content", None):
-                    st.markdown(msg.content)
-            except Exception as e:
-                st.error(f"Genie call failed (the app SP may need CAN RUN on the space): {e}")
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"No recommendation for {line_id}")
+
+    result = rows[0]
+    ranking = result.get("action_ranking")
+    if isinstance(ranking, str):
+        try:
+            result["action_ranking"] = json.loads(ranking)
+        except json.JSONDecodeError:
+            result["action_ranking"] = []
+    return result
+
+
+def ask_genie(question: str) -> dict[str, Any]:
+    if not GENIE_SPACE_ID:
+        raise RuntimeError("GENIE_SPACE_ID is not configured")
+
+    client = workspace_client()
+    message = client.genie.start_conversation_and_wait(GENIE_SPACE_ID, question)
+    text_parts: list[str] = []
+    tables: list[dict[str, Any]] = []
+
+    for attachment in message.attachments or []:
+        if getattr(attachment, "text", None) and attachment.text.content:
+            text_parts.append(attachment.text.content)
+        query = getattr(attachment, "query", None)
+        if not query:
+            continue
+        if getattr(query, "description", None):
+            text_parts.append(query.description)
+        try:
+            result = client.genie.get_message_query_result(
+                GENIE_SPACE_ID, message.conversation_id, message.id
+            )
+            statement = result.statement_response
+            if statement and statement.result and statement.result.data_array:
+                columns = [column.name for column in statement.manifest.schema.columns]
+                rows = [
+                    [json_value(value) for value in row]
+                    for row in statement.result.data_array
+                ]
+                tables.append({"columns": columns, "rows": rows})
+        except Exception:
+            if getattr(query, "query", None):
+                text_parts.append(f"```sql\n{query.query}\n```")
+
+    if not text_parts and getattr(message, "content", None):
+        text_parts.append(str(message.content))
+    return {
+        "answer": "\n\n".join(text_parts) or "Genie returned no text response.",
+        "tables": tables,
+        "conversationId": message.conversation_id,
+    }
+
+
+@app.post("/api/genie", operation_id="askGenie")
+async def genie(request: GenieRequest) -> dict[str, Any]:
+    try:
+        return await run_in_threadpool(ask_genie, request.question)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+if FRONTEND_DIST.exists():
+    assets = FRONTEND_DIST / "assets"
+    if assets.exists():
+        app.mount("/assets", StaticFiles(directory=assets), name="assets")
+
+    @app.get("/{path:path}", include_in_schema=False)
+    async def react_app(path: str) -> FileResponse:
+        candidate = (FRONTEND_DIST / path).resolve()
+        if path and candidate.is_file() and FRONTEND_DIST.resolve() in candidate.parents:
+            return FileResponse(candidate)
+        return FileResponse(FRONTEND_DIST / "index.html")

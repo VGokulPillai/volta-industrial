@@ -454,3 +454,283 @@ export async function getRecentWorkOrders(
     createdAt: r.createdAt.toISOString(),
   }));
 }
+
+// ============================================================================
+// Build 2 connected workflow — Build 1 tables are read-only
+// ============================================================================
+
+export type Build2Line = {
+  lineId: string;
+  plantId: string | null;
+  lineName: string;
+  plantName: string | null;
+  machineType: string | null;
+  criticality: string | null;
+  failureRiskScore: number;
+  downtimeExposureUsd: number;
+  currentStatus: 'healthy' | 'at_risk' | 'critical';
+  vibrationRms: number | null;
+  temperatureC: number | null;
+  partId: string | null;
+  partName: string | null;
+  partLocal: boolean | null;
+  partLeadTimeDays: number | null;
+  openWorkOrderId: string | null;
+  recommendation: string | null;
+  flagged: boolean;
+  workflowId: string | null;
+  workflowStatus: string | null;
+  proposedAction: string | null;
+  approver: string | null;
+  committedAt: string | null;
+};
+
+type ActionName = 'pull_now' | 'run_to_shift_end' | 'expedite_parts_and_run';
+
+/** Capture deterministic Build 1 decision scores whenever the live queue is read. */
+export async function recordSystemTriggeredScores(db: AppDb): Promise<void> {
+  await db.execute(sql`
+    INSERT INTO app.system_decision_scores
+      (line_id, trigger, ranked_actions, recommended_action, flagged, scored_at)
+    SELECT
+      line_id,
+      'line_status_read',
+      jsonb_agg(
+        jsonb_build_object(
+          'action', evaluated_action,
+          'estimatedNetValueUsd', estimated_net_value_usd,
+          'predictedDowntimeCostAvoidsUsd',
+            coalesce(expected_downtime_avoided_hours, 0) * 22000,
+          'actionCostUsd', action_cost_usd
+        )
+        ORDER BY estimated_net_value_usd DESC NULLS LAST
+      ),
+      (array_agg(evaluated_action ORDER BY estimated_net_value_usd DESC NULLS LAST))[1],
+      max(coalesce(estimated_net_value_usd, 0)) > 0,
+      now()
+    FROM app.maintenance_actions
+    GROUP BY line_id
+    ON CONFLICT (line_id, trigger) DO UPDATE SET
+      ranked_actions = excluded.ranked_actions,
+      recommended_action = excluded.recommended_action,
+      flagged = excluded.flagged,
+      scored_at = excluded.scored_at
+  `);
+}
+
+/** Live Visualize query. app.line_status_synced and all Build 1 tables are read-only. */
+export async function getBuild2Lines(
+  db: AppDb,
+  filters: { status?: string; plantId?: string } = {},
+): Promise<Build2Line[]> {
+  await recordSystemTriggeredScores(db);
+  const statusFilter = filters.status
+    ? sql` AND lower(coalesce(ls.risk_band, '')) = ${filters.status}`
+    : sql``;
+  const plantFilter = filters.plantId
+    ? sql` AND pl.plant_id = ${filters.plantId}`
+    : sql``;
+  const result = await db.execute(sql`
+    SELECT
+      ls.line_id, pl.plant_id, coalesce(pl.line_name, ls.line_id) AS line_name,
+      ls.plant_name, pl.machine_type, pl.criticality,
+      ls.failure_risk_score, ls.downtime_exposure_usd, ls.risk_band,
+      ms.vibration_rms, ms.temperature_c,
+      wo.work_order_id, wo.required_part_id, pi.part_name, pi.part_local,
+      pi.lead_time_days,
+      score.recommended_action, coalesce(score.flagged, false) AS flagged,
+      wf.id AS workflow_id, wf.approval_status AS workflow_status,
+      wf.proposed_action, wf.approver, wf.committed_at
+    FROM app.line_status_synced ls
+    LEFT JOIN app.production_lines pl ON pl.line_id = ls.line_id
+    LEFT JOIN app.machine_state ms ON ms.line_id = ls.line_id
+    LEFT JOIN LATERAL (
+      SELECT work_order_id, required_part_id
+      FROM app.work_orders
+      WHERE line_id = ls.line_id AND status IN ('open', 'approved', 'in_progress')
+      ORDER BY created_at DESC LIMIT 1
+    ) wo ON true
+    LEFT JOIN app.parts_inventory pi ON pi.part_id = wo.required_part_id
+    LEFT JOIN app.system_decision_scores score ON score.line_id = ls.line_id
+      AND score.trigger = 'line_status_read'
+    LEFT JOIN LATERAL (
+      SELECT id, approval_status, proposed_action, approver, committed_at
+      FROM app.maintenance_workflows
+      WHERE line_id = ls.line_id
+      ORDER BY created_at DESC LIMIT 1
+    ) wf ON true
+    WHERE 1=1 ${statusFilter} ${plantFilter}
+    ORDER BY score.flagged DESC, ls.failure_risk_score DESC,
+      ls.downtime_exposure_usd DESC
+  `);
+  return (result.rows as Array<Record<string, unknown>>).map((r) => ({
+    lineId: String(r.line_id),
+    plantId: r.plant_id ? String(r.plant_id) : null,
+    lineName: String(r.line_name),
+    plantName: r.plant_name ? String(r.plant_name) : null,
+    machineType: r.machine_type ? String(r.machine_type) : null,
+    criticality: r.criticality ? String(r.criticality) : null,
+    failureRiskScore: Number(r.failure_risk_score),
+    downtimeExposureUsd: Number(r.downtime_exposure_usd),
+    currentStatus:
+      String(r.risk_band) === 'critical'
+        ? 'critical'
+        : ['elevated', 'watch', 'at_risk'].includes(String(r.risk_band))
+          ? 'at_risk'
+          : 'healthy',
+    vibrationRms: r.vibration_rms == null ? null : Number(r.vibration_rms),
+    temperatureC: r.temperature_c == null ? null : Number(r.temperature_c),
+    partId: r.required_part_id ? String(r.required_part_id) : null,
+    partName: r.part_name ? String(r.part_name) : null,
+    partLocal: r.part_local == null ? null : Boolean(r.part_local),
+    partLeadTimeDays: r.lead_time_days == null ? null : Number(r.lead_time_days),
+    openWorkOrderId: r.work_order_id ? String(r.work_order_id) : null,
+    recommendation: r.recommended_action ? String(r.recommended_action) : null,
+    flagged: Boolean(r.flagged),
+    workflowId: r.workflow_id ? String(r.workflow_id) : null,
+    workflowStatus: r.workflow_status ? String(r.workflow_status) : null,
+    proposedAction: r.proposed_action ? String(r.proposed_action) : null,
+    approver: r.approver ? String(r.approver) : null,
+    committedAt: r.committed_at ? new Date(String(r.committed_at)).toISOString() : null,
+  }));
+}
+
+export async function getBuild2Summary(db: AppDb) {
+  const lines = await getBuild2Lines(db);
+  return {
+    totalLines: lines.length,
+    criticalLines: lines.filter((l) => l.currentStatus === 'critical').length,
+    atRiskLines: lines.filter((l) => l.currentStatus === 'at_risk').length,
+    totalDowntimeExposure: lines.reduce((sum, l) => sum + l.downtimeExposureUsd, 0),
+    actionsTaken: lines.filter((l) => l.workflowStatus === 'approved').length,
+    decisionsFlagged: lines.filter((l) => l.flagged).length,
+  };
+}
+
+/** Existing Build 1 Lakebase Search index; no secondary vector store. */
+export async function searchMaintenanceNotes(
+  db: AppDb,
+  query: string,
+  lineId?: string | null,
+) {
+  const trimmed = query.trim();
+  if (!trimmed) return [];
+  const lineFilter = lineId ? sql` AND n.line_id = ${lineId}` : sql``;
+  const result = await db.execute(sql`
+    SELECT n.note_id, n.line_id, n.technician_note, n.machine_type, n.created_at,
+      ts_rank(n.search_tsv, websearch_to_tsquery('english', ${trimmed})) AS rank
+    FROM app.maintenance_notes n
+    WHERE (
+      n.search_tsv @@ websearch_to_tsquery('english', ${trimmed})
+      OR n.technician_note ILIKE ${'%' + trimmed + '%'}
+    ) ${lineFilter}
+    ORDER BY rank DESC, n.created_at DESC
+    LIMIT 10
+  `);
+  return result.rows;
+}
+
+export async function getBuild1ActionRanking(db: AppDb, lineId: string) {
+  const result = await db.execute(sql`
+    SELECT evaluated_action, action_cost_usd,
+      expected_downtime_avoided_hours, estimated_net_value_usd
+    FROM app.maintenance_actions
+    WHERE line_id = ${lineId}
+    ORDER BY estimated_net_value_usd DESC NULLS LAST
+  `);
+  return (result.rows as Array<Record<string, unknown>>).map((r) => ({
+    action: String(r.evaluated_action) as ActionName,
+    actionCostUsd: r.action_cost_usd == null ? null : Number(r.action_cost_usd),
+    expectedDowntimeAvoidedHours:
+      r.expected_downtime_avoided_hours == null
+        ? null
+        : Number(r.expected_downtime_avoided_hours),
+    estimatedNetValueUsd:
+      r.estimated_net_value_usd == null ? null : Number(r.estimated_net_value_usd),
+  }));
+}
+
+export async function proposeMaintenanceWorkflow(
+  db: AppDb,
+  args: {
+    lineId: string;
+    proposedAction: ActionName;
+    proposedBy: string;
+    memo: string;
+    draftedWorkOrder: string;
+  },
+) {
+  const ranking = await getBuild1ActionRanking(db, args.lineId);
+  if (!ranking.length) throw new Error(`No Build 1 action scores found for ${args.lineId}`);
+  const recommended = ranking[0].action;
+  const result = await db.execute(sql`
+    INSERT INTO app.maintenance_workflows
+      (line_id, trigger, score_snapshot, recommended_action, proposed_action,
+       proposed_by, memo, drafted_work_order, approval_status)
+    VALUES (
+      ${args.lineId}, 'assistant', ${JSON.stringify(ranking)}::jsonb,
+      ${recommended}, ${args.proposedAction}, ${args.proposedBy},
+      ${args.memo}, ${args.draftedWorkOrder}, 'proposed'
+    )
+    RETURNING id, created_at
+  `);
+  return result.rows[0] as { id: string; created_at: string };
+}
+
+/** Explicit operator decision, serialized and committed in one transaction. */
+export async function decideMaintenanceWorkflow(
+  db: AppDb,
+  args: {
+    workflowId: string;
+    decision: 'approved' | 'rejected' | 'corrected';
+    approver: string;
+    correction?: string | null;
+    correctedAction?: ActionName | null;
+  },
+) {
+  return db.transaction(async (tx) => {
+    const locked = await tx.execute(sql`
+      SELECT id, line_id, proposed_action
+      FROM app.maintenance_workflows
+      WHERE id = ${args.workflowId}::uuid
+      FOR UPDATE
+    `);
+    const current = locked.rows[0] as Record<string, unknown> | undefined;
+    if (!current) throw new Error('Proposal not found');
+    const status = await tx.execute(sql`
+      SELECT approval_status FROM app.maintenance_workflows
+      WHERE id = ${args.workflowId}::uuid
+    `);
+    if (String((status.rows[0] as Record<string, unknown>).approval_status) !== 'proposed') {
+      throw new Error('Proposal has already been decided');
+    }
+    if (args.decision === 'corrected' && (!args.correction || !args.correctedAction)) {
+      throw new Error('A corrected decision requires correction text and corrected_action');
+    }
+    const committedAt = new Date();
+    const updated = await tx.execute(sql`
+      UPDATE app.maintenance_workflows SET
+        approval_status = ${args.decision},
+        proposed_action = ${args.correctedAction ?? String(current.proposed_action)},
+        approver = ${args.approver},
+        correction = ${args.correction ?? null},
+        decided_at = ${committedAt},
+        committed_at = ${committedAt}
+      WHERE id = ${args.workflowId}::uuid
+      RETURNING id, line_id, proposed_action, approval_status, approver,
+        created_at, decided_at, committed_at
+    `);
+    return updated.rows[0];
+  });
+}
+
+export async function getWorkflow(db: AppDb, workflowId: string) {
+  const result = await db.execute(sql`
+    SELECT id, line_id, recommended_action, proposed_action, proposed_by,
+      memo, drafted_work_order, approval_status, approver, correction,
+      score_snapshot, created_at, decided_at, committed_at
+    FROM app.maintenance_workflows
+    WHERE id = ${workflowId}::uuid
+  `);
+  return result.rows[0] ?? null;
+}

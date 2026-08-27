@@ -14,12 +14,12 @@
  *     the enriched line_status view immediately on the next read.
  */
 import { useEffect, useMemo, useState } from 'react';
-import { Sparkles, ArrowRight, Plus, RefreshCw, FileText } from 'lucide-react';
+import { Sparkles, ArrowRight, Plus, RefreshCw } from 'lucide-react';
 import {
   fetchLines,
   fetchSummary,
-  createWorkOrder,
-  fetchWorkOrders,
+  createProposal,
+  decideProposal,
 } from '@/lib/plantfloor';
 import { useSession } from '@/lib/api';
 import { dataMutated } from '@/lib/events';
@@ -27,7 +27,6 @@ import { dockController } from '@/chat/dockController';
 import type {
   PlantFloorLine,
   PlantFloorSummary,
-  WorkOrderRow,
   LineStatus,
   MaintenanceAction,
 } from '@/shared/types';
@@ -36,27 +35,25 @@ import { KpiCards } from './KpiCards';
 export function OperationsView() {
   const [lines, setLines] = useState<PlantFloorLine[]>([]);
   const [summary, setSummary] = useState<PlantFloorSummary | null>(null);
-  const [workOrders, setWorkOrders] = useState<WorkOrderRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<LineStatus | 'all'>('all');
   const [search, setSearch] = useState('');
   const [showInsertForm, setShowInsertForm] = useState(false);
+  const [decidingId, setDecidingId] = useState<string | null>(null);
   const { config } = useSession();
 
   async function reload() {
     setLoading(true);
     try {
-      const [lineData, summaryData, orderData] = await Promise.all([
+      const [lineData, summaryData] = await Promise.all([
         fetchLines({
           status: statusFilter === 'all' ? undefined : statusFilter,
         }),
         fetchSummary(),
-        fetchWorkOrders(10),
       ]);
       setLines(lineData);
       setSummary(summaryData);
-      setWorkOrders(orderData);
       setError(null);
     } catch (e) {
       setError((e as Error).message);
@@ -85,10 +82,42 @@ export function OperationsView() {
       (l) =>
         l.lineId.toLowerCase().includes(q) ||
         l.lineName.toLowerCase().includes(q) ||
-        l.plantId.toLowerCase().includes(q) ||
+        (l.plantId ?? '').toLowerCase().includes(q) ||
         (l.plantName ?? '').toLowerCase().includes(q),
     );
   }, [lines, search]);
+
+  async function decide(
+    line: PlantFloorLine,
+    decision: 'approved' | 'rejected' | 'corrected',
+  ) {
+    if (!line.workflowId) return;
+    let correction: string | null = null;
+    let correctedAction: MaintenanceAction | null = null;
+    if (decision === 'corrected') {
+      correction = window.prompt('Describe the required correction:')?.trim() || null;
+      if (!correction) return;
+      correctedAction =
+        (window.prompt(
+          'Corrected action: pull_now, run_to_shift_end, or expedite_parts_and_run',
+          line.proposedAction ?? line.recommendation ?? 'pull_now',
+        ) as MaintenanceAction | null) ?? null;
+    }
+    setDecidingId(line.workflowId);
+    try {
+      await decideProposal({
+        workflowId: line.workflowId,
+        decision,
+        correction,
+        corrected_action: correctedAction,
+      });
+      dataMutated.emit();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setDecidingId(null);
+    }
+  }
 
   return (
     <div className="h-full overflow-y-auto">
@@ -125,7 +154,7 @@ export function OperationsView() {
               className="rounded-xl border border-border bg-card hover:border-foreground/30 hover:shadow-sm px-4 py-3 transition-all flex items-center gap-2"
             >
               <Plus className="size-4" />
-              <span className="text-sm font-medium">New Work Order</span>
+              <span className="text-sm font-medium">New Proposal</span>
             </button>
             <button
               onClick={() => void reload()}
@@ -195,8 +224,8 @@ export function OperationsView() {
                 <th className="text-left px-4 py-3 font-semibold text-muted-foreground">Risk</th>
                 <th className="text-right px-4 py-3 font-semibold text-muted-foreground">Downtime Exp.</th>
                 <th className="text-left px-4 py-3 font-semibold text-muted-foreground">Status</th>
-                <th className="text-left px-4 py-3 font-semibold text-muted-foreground">Action Taken</th>
-                <th className="text-left px-4 py-3 font-semibold text-muted-foreground">Memo</th>
+                <th className="text-left px-4 py-3 font-semibold text-muted-foreground">Ranked Decision</th>
+                <th className="text-left px-4 py-3 font-semibold text-muted-foreground">Human Decision</th>
               </tr>
             </thead>
             <tbody>
@@ -207,7 +236,23 @@ export function OperationsView() {
               ) : (
                 filteredLines.map((line) => (
                   <tr key={line.lineId + ':' + line.plantId} className="border-b border-border/50 hover:bg-muted/30 transition-colors">
-                    <td className="px-4 py-3 font-medium">{line.lineName || line.lineId}</td>
+                    <td className="px-4 py-3">
+                      <div className="font-medium">{line.lineName || line.lineId}</div>
+                      <div className="text-xs text-muted-foreground mt-1">
+                        {line.machineType ?? 'Machine'} · vibration {line.vibrationRms ?? '—'} ·
+                        {' '}temp {line.temperatureC ?? '—'}°C
+                      </div>
+                      {(line.openWorkOrderId || line.partId) && (
+                        <div className="text-xs text-muted-foreground mt-1">
+                          WO {line.openWorkOrderId ?? '—'} · {line.partName ?? line.partId}
+                          {line.partLocal === false
+                            ? ` · non-local (${line.partLeadTimeDays ?? '—'}d)`
+                            : line.partLocal
+                              ? ' · local'
+                              : ''}
+                        </div>
+                      )}
+                    </td>
                     <td className="px-4 py-3 text-muted-foreground">{line.plantName || line.plantId}</td>
                     <td className="px-4 py-3">
                       <span className={`inline-block px-2 py-0.5 rounded text-xs font-semibold ${
@@ -225,23 +270,28 @@ export function OperationsView() {
                       <StatusBadge status={line.currentStatus} />
                     </td>
                     <td className="px-4 py-3">
-                      {line.actionType ? (
+                      {line.recommendation ? (
                         <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-semibold bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-300">
-                          {line.actionType.replace(/_/g, ' ')}
+                          {line.flagged ? 'Flagged · ' : ''}
+                          {line.recommendation.replace(/_/g, ' ')}
                         </span>
                       ) : (
                         <span className="text-xs text-muted-foreground">—</span>
                       )}
                     </td>
                     <td className="px-4 py-3 max-w-xs">
-                      {line.actionMemo ? (
-                        <span className="text-xs text-muted-foreground truncate block" title={line.actionMemo}>
-                          <FileText className="size-3 inline mr-1" />
-                          {line.actionMemo.length > 80
-                            ? line.actionMemo.slice(0, 80) + '…'
-                            : line.actionMemo}
-                        </span>
-                      ) : null}
+                      {line.workflowStatus === 'proposed' && line.workflowId ? (
+                        <div className="flex flex-wrap gap-1">
+                          <button disabled={decidingId === line.workflowId} onClick={() => void decide(line, 'approved')} className="px-2 py-1 rounded bg-green-700 text-white text-xs">Approve</button>
+                          <button disabled={decidingId === line.workflowId} onClick={() => void decide(line, 'rejected')} className="px-2 py-1 rounded bg-red-700 text-white text-xs">Reject</button>
+                          <button disabled={decidingId === line.workflowId} onClick={() => void decide(line, 'corrected')} className="px-2 py-1 rounded border border-border text-xs">Correct</button>
+                        </div>
+                      ) : (
+                        <div className="text-xs text-muted-foreground">
+                          {line.workflowStatus ?? 'No proposal'}
+                          {line.approver ? ` · ${line.approver}` : ''}
+                        </div>
+                      )}
                     </td>
                   </tr>
                 ))
@@ -250,54 +300,6 @@ export function OperationsView() {
           </table>
         </div>
 
-        {/* Recent work orders */}
-        {workOrders.length > 0 && (
-          <div className="space-y-3">
-            <h2 className="text-sm font-semibold uppercase tracking-wider text-muted-foreground">
-              Recent work orders
-            </h2>
-            <div className="rounded-xl border border-border overflow-hidden">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="bg-muted/50 border-b border-border">
-                    <th className="text-left px-4 py-2 font-semibold text-muted-foreground">Line</th>
-                    <th className="text-left px-4 py-2 font-semibold text-muted-foreground">Action</th>
-                    <th className="text-left px-4 py-2 font-semibold text-muted-foreground">Status</th>
-                    <th className="text-left px-4 py-2 font-semibold text-muted-foreground">Approved By</th>
-                    <th className="text-left px-4 py-2 font-semibold text-muted-foreground">Memo</th>
-                    <th className="text-left px-4 py-2 font-semibold text-muted-foreground">Created</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {workOrders.map((wo) => (
-                    <tr key={wo.id} className="border-b border-border/50">
-                      <td className="px-4 py-2 font-medium">{wo.lineId}</td>
-                      <td className="px-4 py-2">{wo.actionType.replace(/_/g, ' ')}</td>
-                      <td className="px-4 py-2">
-                        <span className="px-2 py-0.5 rounded text-xs font-semibold bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300">
-                          {wo.status}
-                        </span>
-                      </td>
-                      <td className="px-4 py-2 text-muted-foreground">{wo.approvedBy ?? '—'}</td>
-                      <td className="px-4 py-2 max-w-xs">
-                        {wo.memo ? (
-                          <span className="text-xs text-muted-foreground truncate block" title={wo.memo}>
-                            {wo.memo.length > 60 ? wo.memo.slice(0, 60) + '…' : wo.memo}
-                          </span>
-                        ) : (
-                          <span className="text-xs text-muted-foreground">—</span>
-                        )}
-                      </td>
-                      <td className="px-4 py-2 text-muted-foreground text-xs">
-                        {new Date(wo.createdAt).toLocaleString()}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        )}
       </div>
     </div>
   );
@@ -316,7 +318,7 @@ function StatusBadge({ status }: { status: LineStatus }) {
   );
 }
 
-/** Inline form for inserting a new work order. */
+/** Inline proposal form; approval is always a separate human transaction. */
 function InsertWorkOrderForm({
   lines,
   onInserted,
@@ -335,18 +337,18 @@ function InsertWorkOrderForm({
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!lineId || !workOrderText.trim()) {
-      setErr('Line and work order text are required.');
+    if (!lineId || !workOrderText.trim() || !memo.trim()) {
+      setErr('Line, memo, and work order text are required.');
       return;
     }
     setSubmitting(true);
     setErr(null);
     try {
-      await createWorkOrder({
+      await createProposal({
         line_id: lineId,
-        action_type: actionType,
+        proposed_action: actionType,
         drafted_work_order: workOrderText,
-        memo: memo || null,
+        memo,
       });
       onInserted();
     } catch (e) {
@@ -361,7 +363,7 @@ function InsertWorkOrderForm({
       onSubmit={handleSubmit}
       className="rounded-xl border border-border bg-card p-5 space-y-4"
     >
-      <div className="text-sm font-semibold">New Work Order</div>
+      <div className="text-sm font-semibold">New Maintenance Proposal</div>
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
         <div>
           <label className="block text-xs font-semibold text-muted-foreground mb-1">Line</label>
@@ -402,7 +404,7 @@ function InsertWorkOrderForm({
       </div>
       <div>
         <label className="block text-xs font-semibold text-muted-foreground mb-1">
-          Memo / Analysis Summary (optional)
+          Memo / Analysis Summary
         </label>
         <textarea
           value={memo}
@@ -419,7 +421,7 @@ function InsertWorkOrderForm({
           disabled={submitting}
           className="px-4 py-2 rounded-lg bg-primary text-primary-foreground text-sm font-semibold hover:opacity-90 disabled:opacity-50"
         >
-          {submitting ? 'Inserting…' : 'Insert Work Order'}
+          {submitting ? 'Proposing…' : 'Create Proposal'}
         </button>
         <button
           type="button"

@@ -9,7 +9,7 @@ import { okOrThrow } from './api';
 import type {
   PlantFloorLine,
   PlantFloorSummary,
-  WorkOrderRow,
+  WorkflowDecision,
   MaintenanceAction,
 } from '@/shared/types';
 
@@ -36,33 +36,41 @@ export async function fetchSummary(): Promise<PlantFloorSummary> {
   return res.json();
 }
 
-/** Insert a new work order row (manual insert from the UI). */
-export async function createWorkOrder(args: {
+/** Save an assistant/operator draft as a proposal; this does not approve it. */
+export async function createProposal(args: {
   line_id: string;
-  action_type: MaintenanceAction;
-  part_id?: string | null;
+  proposed_action: MaintenanceAction;
   drafted_work_order: string;
-  memo?: string | null;
-  predicted_downtime_cost_avoided_usd?: number | null;
-}): Promise<{ ok: boolean; action_id: string }> {
+  memo: string;
+}): Promise<{ ok: boolean; workflow_id: string }> {
   const res = await okOrThrow(
-    await fetch('/api/operations/work-orders', {
+    await fetch('/api/operations/proposals', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(args),
     }),
-    '/api/operations/work-orders',
+    '/api/operations/proposals',
   );
   return res.json();
 }
 
-/** Fetch recent work orders. */
-export async function fetchWorkOrders(
-  limit = 20,
-): Promise<WorkOrderRow[]> {
+export async function decideProposal(args: {
+  workflowId: string;
+  decision: 'approved' | 'rejected' | 'corrected';
+  correction?: string | null;
+  corrected_action?: MaintenanceAction | null;
+}): Promise<{ ok: boolean; next_read: WorkflowDecision }> {
   const res = await okOrThrow(
-    await fetch(`/api/operations/work-orders?limit=${limit}`),
-    '/api/operations/work-orders',
+    await fetch(`/api/operations/proposals/${args.workflowId}/decision`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        decision: args.decision,
+        correction: args.correction ?? null,
+        corrected_action: args.corrected_action ?? null,
+      }),
+    }),
+    '/api/operations/proposals/:id/decision',
   );
   return res.json();
 }
