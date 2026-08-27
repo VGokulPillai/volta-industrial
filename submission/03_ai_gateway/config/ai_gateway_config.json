@@ -1,0 +1,55 @@
+{
+  "_comment": "Unity AI Gateway config for the Volta maintenance assistant's model serving endpoint. Apply with apply_gateway_config.sh (PUT /api/2.0/serving-endpoints/{name}/ai-gateway). Replace ${...} placeholders. Fields follow the AI Gateway config schema; token-based rate limits are applied where supported.",
+
+  "usage_tracking_config": {
+    "enabled": true
+  },
+
+  "inference_table_config": {
+    "enabled": true,
+    "catalog_name": "${DEMO_CATALOG}",
+    "schema_name": "${DEMO_SCHEMA}",
+    "table_name_prefix": "volta_ai_gateway"
+  },
+
+  "rate_limits": [
+    {
+      "key": "endpoint",
+      "calls": 300,
+      "renewal_period": "minute"
+    },
+    {
+      "key": "user",
+      "calls": 60,
+      "renewal_period": "minute"
+    }
+  ],
+
+  "token_rate_limits_where_supported": [
+    {
+      "key": "endpoint",
+      "tokens": 2000000,
+      "renewal_period": "minute"
+    },
+    {
+      "key": "user",
+      "tokens": 400000,
+      "renewal_period": "minute"
+    }
+  ],
+
+  "guardrails": {
+    "input": {
+      "pii": { "behavior": "BLOCK" },
+      "safety": true
+    },
+    "output": {
+      "pii": { "behavior": "BLOCK" },
+      "safety": true
+    }
+  },
+
+  "fallback_config": {
+    "enabled": false
+  }
+}
