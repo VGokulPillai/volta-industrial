@@ -211,6 +211,10 @@ export const workOrdersApp = appSchema.table(
     }).notNull(),
     partId: text('part_id'),
     draftedWo: text('drafted_wo').notNull(),
+    /** AI-generated analysis memo / summary produced as output of the
+     *  agent's investigation. Stored alongside the work order so the
+     *  plant lead can review the rationale at any time. */
+    memo: text('memo'),
     predictedDowntimeCostAvoidsUsd: doublePrecision('predicted_downtime_cost_avoided_usd'),
     status: text('status', {
       enum: ['drafted', 'approved', 'rejected'],

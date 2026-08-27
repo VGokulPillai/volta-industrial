@@ -1,42 +1,36 @@
 /**
- * Three KPI cards at the top of the Operations page: pending / approved /
- * escalated with counts + $ totals. Drives the "live update" demo moment —
- * click a decision and the numbers tick. When the agent's bulk write fires
- * `dataMutated`, each card's `count` is compared to the previous value and
- * only the cards that *moved* pulse a primary ring (see usePulseOnChange).
+ * Plant-floor KPI cards: downtime exposure / critical lines / actions taken.
+ * Drives the "live update" demo moment — when the agent writes a work order,
+ * `dataMutated` fires, OperationsView refetches summary, and these cards tick.
  */
-import { AlertTriangle, CheckCircle2, PackageOpen } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, Activity } from 'lucide-react';
 import { usePulseOnChange } from '@/lib/usePulseOnChange';
-import type { ReturnsSummary, ReturnStatus } from '@/shared/types';
+import type { PlantFloorSummary } from '@/shared/types';
 
-export function KpiCards({ summary }: { summary: ReturnsSummary[] }) {
-  const byStatus = new Map<ReturnStatus, ReturnsSummary>();
-  for (const s of summary) byStatus.set(s.status, s);
-  const pending = byStatus.get('pending');
-  const approved = byStatus.get('approved');
-  const escalated = byStatus.get('escalated');
+export function KpiCards({ summary }: { summary: PlantFloorSummary }) {
   return (
     <div className="grid grid-cols-3 gap-2 sm:gap-4">
       <Card
-        label="Pending"
-        count={pending?.n ?? 0}
-        value={pending?.total_usd ?? '0'}
-        icon={<PackageOpen className="size-4" />}
+        label="Downtime Exposure"
+        count={summary.criticalLines + summary.atRiskLines}
+        value={summary.totalDowntimeExposure}
+        icon={<AlertTriangle className="size-4" />}
+        tone="danger"
+        prefix="$"
+      />
+      <Card
+        label="Critical Lines"
+        count={summary.criticalLines}
+        value={null}
+        icon={<Activity className="size-4" />}
         tone="neutral"
       />
       <Card
-        label="Approved"
-        count={approved?.n ?? 0}
-        value={approved?.total_usd ?? '0'}
+        label="Actions Taken"
+        count={summary.actionsTaken}
+        value={null}
         icon={<CheckCircle2 className="size-4" />}
         tone="success"
-      />
-      <Card
-        label="Escalated to QA"
-        count={escalated?.n ?? 0}
-        value={escalated?.total_usd ?? '0'}
-        icon={<AlertTriangle className="size-4" />}
-        tone="danger"
       />
     </div>
   );
@@ -48,12 +42,14 @@ function Card({
   value,
   icon,
   tone,
+  prefix,
 }: {
   label: string;
   count: number;
-  value: string;
+  value: number | null;
   icon: React.ReactNode;
   tone: 'neutral' | 'success' | 'danger';
+  prefix?: string;
 }) {
   const pulse = usePulseOnChange(count);
   const toneClass =
@@ -62,17 +58,17 @@ function Card({
       : tone === 'danger'
         ? 'text-destructive'
         : 'text-foreground';
-  // On phone the $ value stacks BELOW the count (3 cards in a row at 375px
-  // can't fit both inline). On sm+ they sit on one baseline like before.
-  // Phone $ uses a "compact" abbreviation ($674.9K) to keep the line short.
-  const valueNum = Number(value);
-  const compactDollar = new Intl.NumberFormat(undefined, {
-    notation: 'compact',
-    maximumFractionDigits: 1,
-  }).format(valueNum);
-  const fullDollar = valueNum.toLocaleString(undefined, {
-    maximumFractionDigits: 0,
-  });
+  const compactVal =
+    value != null
+      ? new Intl.NumberFormat(undefined, {
+          notation: 'compact',
+          maximumFractionDigits: 1,
+        }).format(value)
+      : null;
+  const fullVal =
+    value != null
+      ? value.toLocaleString(undefined, { maximumFractionDigits: 0 })
+      : null;
   return (
     <div
       className={`rounded-xl border border-border bg-card p-3 sm:p-5 transition-shadow ${
@@ -87,10 +83,12 @@ function Card({
         <div className="display text-2xl sm:text-3xl font-semibold text-foreground">
           {count.toLocaleString()}
         </div>
-        <div className="text-xs sm:text-sm text-muted-foreground">
-          <span className="sm:hidden">${compactDollar}</span>
-          <span className="hidden sm:inline">· ${fullDollar}</span>
-        </div>
+        {fullVal && (
+          <div className="text-xs sm:text-sm text-muted-foreground">
+            <span className="sm:hidden">{prefix}{compactVal}</span>
+            <span className="hidden sm:inline">· {prefix}{fullVal}</span>
+          </div>
+        )}
       </div>
     </div>
   );

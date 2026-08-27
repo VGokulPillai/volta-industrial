@@ -172,6 +172,50 @@ export type CustomerOrder = {
   item_count: number;
 };
 
+// ============================================================================
+// Plant-floor domain types (Volta Industrial)
+// ============================================================================
+
+export type LineStatus = 'healthy' | 'at_risk' | 'critical';
+export type MaintenanceAction = 'pull_now' | 'run_to_shift_end' | 'expedite_parts_and_run';
+
+/** Enriched line row: line_status LEFT JOIN latest work_orders_app row. */
+export type PlantFloorLine = {
+  lineId: string;
+  plantId: string;
+  lineName: string;
+  plantName: string | null;
+  region: string | null;
+  failureRiskScore: number;
+  downtimeExposureUsd: number;
+  currentStatus: LineStatus;
+  /** From LEFT JOIN work_orders_app — null means no action taken yet. */
+  actionType: string | null;
+  actionStatus: string | null;
+  actionMemo: string | null;
+  actionId: string | null;
+  actionAt: string | null;
+};
+
+export type PlantFloorSummary = {
+  totalLines: number;
+  criticalLines: number;
+  atRiskLines: number;
+  totalDowntimeExposure: number;
+  actionsTaken: number;
+};
+
+export type WorkOrderRow = {
+  id: string;
+  lineId: string;
+  actionType: string;
+  status: string;
+  memo: string | null;
+  draftedWo: string;
+  approvedBy: string | null;
+  createdAt: string;
+};
+
 export type ActivityEvent =
   | {
       kind: 'email';

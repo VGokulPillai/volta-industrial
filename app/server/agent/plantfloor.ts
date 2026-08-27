@@ -301,6 +301,10 @@ function makeTools(ctx: AgentContext): Tool[] {
       drafted_work_order: z
         .string()
         .describe('The full drafted work order text (the maintenance ticket).'),
+      memo: z
+        .string()
+        .nullable()
+        .describe('A brief executive summary / analysis memo (2–4 sentences) summarizing the investigation findings, risk assessment, and rationale for the recommended action. This is auto-generated as the output of the analysis — it is stored with the work order for later review.'),
       predicted_downtime_cost_avoided_usd: z
         .number()
         .nullable()
@@ -311,6 +315,7 @@ function makeTools(ctx: AgentContext): Tool[] {
       action_type,
       part_id,
       drafted_work_order,
+      memo,
       predicted_downtime_cost_avoided_usd,
     }) =>
       mlflow.withSpan(
@@ -320,6 +325,7 @@ function makeTools(ctx: AgentContext): Tool[] {
             actionType: action_type,
             partId: part_id,
             draftedWo: drafted_work_order,
+            memo: memo,
             predictedDowntimeCostAvoidsUsd: predicted_downtime_cost_avoided_usd,
             userEmail: ctx.userEmail,
           });
@@ -573,10 +579,13 @@ search_parts(query) — search the parts catalog via Lakebase Search over names 
   part_local, lead_time_days. Use when exploring parts or verifying availability.
 
 execute_maintenance_action(line_id, action_type, part_id?, drafted_work_order,
-  predicted_downtime_cost_avoided_usd?) — THE WRITE TOOL, APPROVAL-GATED.
+  memo?, predicted_downtime_cost_avoided_usd?) — THE WRITE TOOL, APPROVAL-GATED.
   Record the approved action to app.work_orders_app: action_type, line_id,
-  part_id, drafted_wo, predicted_downtime_cost_avoided_usd, status='approved',
-  approved_by from userEmail, plus an audit entry. Inputs are a FILTER + drafted
+  part_id, drafted_wo, memo (analysis summary), predicted_downtime_cost_avoided_usd,
+  status='approved', approved_by from userEmail, plus an audit entry.
+  The `memo` field is an auto-drafted executive summary of your analysis —
+  a 2–4 sentence note capturing the investigation findings, risk assessment,
+  and rationale. ALWAYS generate a memo. Inputs are a FILTER + drafted
   text, never a list of ids. **This is how you execute phase 3.** Do NOT call
   until the user has explicitly approved.
 
@@ -688,6 +697,11 @@ user has explicitly approved.
          action_type: the recommended_action from rank_maintenance_actions
          part_id: the candidate_part_id (or null if action doesn't need parts)
          drafted_work_order: the full work order text from phase 2 step 4
+         memo: a 2–4 sentence executive summary of YOUR analysis —
+           what you found (investigation), what the risk is (risk score,
+           downtime exposure), and why this action was chosen (ML ranking,
+           part locality). This memo is stored with the work order and
+           serves as the auto-drafted analysis note. ALWAYS include it.
          predicted_downtime_cost_avoided_usd: from rank_maintenance_actions
 
     B. Final summary — see "SUMMARY FORMAT" below. Use counts + values
