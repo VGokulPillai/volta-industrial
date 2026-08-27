@@ -1,0 +1,19 @@
+command:
+  - streamlit
+  - run
+  - app.py
+  - --server.port
+  - "8080"
+  - --server.address
+  - "0.0.0.0"
+  - --server.headless
+  - "true"
+env:
+  - name: DATABRICKS_WAREHOUSE_ID
+    value: "ced20c73f16a2915"
+  - name: VOLTA_CATALOG
+    value: "serverless_stable_wx20co_catalog"
+  - name: VOLTA_SCHEMA
+    value: "dev_gokul_pillai_volta_industrial"
+  - name: GENIE_SPACE_ID
+    value: "01f1a207a81d110baaa1125462561889"

@@ -1,0 +1,36 @@
+{
+  "name": "volta-maintenance-gw",
+  "config": {
+    "served_entities": [
+      {
+        "name": "gpt-proxy",
+        "external_model": {
+          "name": "databricks-gpt-5-4",
+          "provider": "databricks-model-serving",
+          "task": "llm/v1/chat",
+          "databricks_model_serving_config": {
+            "databricks_api_token": "{{secrets/volta/gw_token}}",
+            "databricks_workspace_url": "https://fevm-serverless-stable-wx20co.cloud.databricks.com"
+          }
+        }
+      }
+    ]
+  },
+  "ai_gateway": {
+    "usage_tracking_config": { "enabled": true },
+    "inference_table_config": {
+      "enabled": true,
+      "catalog_name": "serverless_stable_wx20co_catalog",
+      "schema_name": "dev_gokul_pillai_volta_industrial",
+      "table_name_prefix": "volta_gw"
+    },
+    "rate_limits": [
+      { "calls": 120, "renewal_period": "minute", "key": "endpoint" },
+      { "calls": 20, "renewal_period": "minute", "key": "user" }
+    ]
+  },
+  "tags": [
+    { "key": "application", "value": "volta-maintenance" },
+    { "key": "cost_center", "value": "plant-ops" }
+  ]
+}

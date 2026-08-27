@@ -1,0 +1,46 @@
+{
+  "version": 2,
+  "data_sources": {
+    "tables": [
+      {
+        "identifier": "serverless_stable_wx20co_catalog.dev_gokul_pillai_volta_industrial.gold_line_status",
+        "column_configs": [
+          {"column_name": "current_status", "enable_format_assistance": true, "enable_entity_matching": true},
+          {"column_name": "downtime_exposure_usd", "enable_format_assistance": true},
+          {"column_name": "failure_risk_score", "enable_format_assistance": true},
+          {"column_name": "line_id", "enable_format_assistance": true, "enable_entity_matching": true},
+          {"column_name": "machine_type", "enable_format_assistance": true, "enable_entity_matching": true},
+          {"column_name": "plant_id", "enable_format_assistance": true, "enable_entity_matching": true},
+          {"column_name": "plant_name", "enable_format_assistance": true, "enable_entity_matching": true},
+          {"column_name": "risk_band", "enable_format_assistance": true, "enable_entity_matching": true}
+        ]
+      },
+      {
+        "identifier": "serverless_stable_wx20co_catalog.dev_gokul_pillai_volta_industrial.gold_maintenance_outcomes",
+        "column_configs": [
+          {"column_name": "action_type", "enable_format_assistance": true, "enable_entity_matching": true},
+          {"column_name": "downtime_cost_avoided_usd", "enable_format_assistance": true},
+          {"column_name": "line_id", "enable_format_assistance": true, "enable_entity_matching": true}
+        ]
+      },
+      {
+        "identifier": "serverless_stable_wx20co_catalog.dev_gokul_pillai_volta_industrial.gold_maintenance_recommendations",
+        "column_configs": [
+          {"column_name": "line_id", "enable_format_assistance": true, "enable_entity_matching": true},
+          {"column_name": "predicted_net_value_usd", "enable_format_assistance": true},
+          {"column_name": "recommended_action", "enable_format_assistance": true, "enable_entity_matching": true}
+        ]
+      },
+      {
+        "identifier": "serverless_stable_wx20co_catalog.dev_gokul_pillai_volta_industrial.gold_open_atrisk",
+        "column_configs": [
+          {"column_name": "candidate_part_id", "enable_format_assistance": true, "enable_entity_matching": true},
+          {"column_name": "line_id", "enable_format_assistance": true, "enable_entity_matching": true},
+          {"column_name": "part_lead_time_days", "enable_format_assistance": true},
+          {"column_name": "part_local", "enable_format_assistance": true},
+          {"column_name": "plant_id", "enable_format_assistance": true, "enable_entity_matching": true}
+        ]
+      }
+    ]
+  }
+}
